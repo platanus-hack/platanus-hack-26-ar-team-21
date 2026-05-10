@@ -12,7 +12,7 @@ import hmac as hmac_mod
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
@@ -29,17 +29,23 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 
 def _verify_shopify_hmac(body: bytes, signature: str) -> bool:
-    """Valida la firma HMAC-SHA256 que Shopify adjunta en cada webhook.
-
-    Si SHOPIFY_API_SECRET no está configurado, se omite la validación
-    (útil en desarrollo local sin un ngrok activo).
-    """
-    if not settings.SHOPIFY_API_SECRET:
-        return True
+    """Valida la firma HMAC-SHA256 que Shopify adjunta en cada webhook."""
+    if not settings.SHOPIFY_API_SECRET or not signature:
+        return False
     expected = base64.b64encode(
         hmac_mod.new(settings.SHOPIFY_API_SECRET.encode(), body, hashlib.sha256).digest()
     ).decode()
-    return hmac_mod.compare_digest(expected, signature)
+    return hmac_mod.compare_digest(expected, signature.strip())
+
+
+def _normalize_shop_domain(raw: str) -> str | None:
+    normalized = raw.strip().lower()
+    if not normalized:
+        return None
+    normalized = normalized.removeprefix("https://").removeprefix("http://").rstrip("/")
+    if not normalized:
+        return None
+    return normalized
 
 
 async def _run_vera_background(merchant_id: uuid.UUID) -> None:
@@ -60,23 +66,34 @@ async def shopify_order_webhook(
     """Recibe órdenes nuevas de Shopify y activa Vera cuando corresponde."""
     body = await request.body()
 
+    if not settings.SHOPIFY_API_SECRET:
+        logger.error("shopify webhook rejected: SHOPIFY_API_SECRET is not configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook de Shopify no configurado",
+        )
+
     if not _verify_shopify_hmac(body, x_shopify_hmac_sha256):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="HMAC inválido")
 
     try:
         payload = json.loads(body)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="JSON inválido")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="JSON inválido",
+        ) from exc
 
-    # Identificar merchant por dominio de la tienda
-    shop_domain = x_shopify_shop_domain or settings.SHOPIFY_SHOP_DOMAIN
+    # Identificar merchant por dominio de la tienda que Shopify firma.
+    shop_domain = _normalize_shop_domain(x_shopify_shop_domain)
+    if shop_domain is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Falta X-Shopify-Shop-Domain",
+        )
     merchant = (
         await db.execute(select(Merchant).where(Merchant.shopify_shop_domain == shop_domain))
     ).scalar_one_or_none()
-
-    if merchant is None:
-        # Fallback demo: primer merchant de la DB (útil cuando hay una sola tienda)
-        merchant = (await db.execute(select(Merchant).limit(1))).scalar_one_or_none()
 
     if merchant is None:
         logger.warning("webhook shopify: no merchant encontrado para domain=%s", shop_domain)
@@ -90,10 +107,10 @@ async def shopify_order_webhook(
         sold_at = (
             datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
             if created_at_raw
-            else datetime.now(timezone.utc)
+            else datetime.now(UTC)
         )
     except (ValueError, AttributeError):
-        sold_at = datetime.now(timezone.utc)
+        sold_at = datetime.now(UTC)
 
     # Persistir productos y ventas de cada line item
     for item in line_items:
@@ -173,7 +190,11 @@ async def shopify_order_webhook(
     )
 
     if sales_since_last_run >= threshold:
-        logger.info("Activando Vera para merchant=%s (ventas=%d)", merchant.id, sales_since_last_run)
+        logger.info(
+            "Activando Vera para merchant=%s (ventas=%d)",
+            merchant.id,
+            sales_since_last_run,
+        )
         asyncio.create_task(_run_vera_background(merchant.id))
 
     return {"status": "ok", "sales_since_last_run": sales_since_last_run, "threshold": threshold}
